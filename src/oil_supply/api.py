@@ -77,6 +77,28 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "receive":
+                return Response(200, self.service.receive_transfer(actor, parts[1]))
+            if method == "POST" and path == "/quality/samples":
+                return Response(201, self.service.register_quality_sample(actor, payload))
+            if method == "POST" and path == "/quality/tests":
+                return Response(201, self.service.record_test_version(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["quality", "tests"] and parts[3] == "confirm":
+                return Response(200, self.service.confirm_test_version(actor, int(parts[2]), payload.get("note", "")))
+            if method == "POST" and path == "/blends":
+                return Response(201, self.service.record_blend(actor, payload))
+            if method == "POST" and path == "/inventory/reservations":
+                return Response(201, self.service.create_reservation(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["inventory", "reservations"] and parts[3] == "release":
+                return Response(200, self.service.release_reservation(actor, parts[2]))
+            if method == "POST" and path == "/isolation/cases":
+                return Response(201, self.service.open_isolation_case(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["isolation", "cases"]:
+                return Response(200, self.service.isolation_case(parts[2]))
+            if method == "POST" and len(parts) == 3 and parts[:2] == ["isolation", "cases"] and parts[2] == "release":
+                return Response(200, self.service.release_isolation_case(actor, parts[2], payload))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["inventory", "lots"] and parts[3] == "trace":
+                return Response(200, self.service.lot_trace(parts[2]))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":

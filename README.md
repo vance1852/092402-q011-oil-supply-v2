@@ -12,6 +12,16 @@
 - 供应情景保存价格变化、线路能力变化和需求变化，审批后产生可重放的确定性结果；
 - 关键写操作进入哈希串联审计日志，可离线验证事件顺序和内容完整性。
 
+质量隔离子域解决实验室复测不一致时的批次处置问题：
+
+- 质量样品绑定库存批次并记录代表数量；检测结果（RON/MON 等）只能追加为后继版本，历史版本保留；
+- 检测结论必须经两名与记录人不同的人员确认（草稿→确认），不合格或存疑结论才能立案；
+- 混兑按配料实际数量建立谱系边，并强制产出量等于配料合计；
+- 隔离案件沿实际数量谱系传播：罐内剩余按比例锁定，已混兑到下游批次的数量继续传播，仍在途转运标记为 `held` 待处置，已交付历史不回滚；同罐无关批次不受影响；
+- 发运和库存预留在事务中拒绝使用被影响数量；隔离也不会与既有预留重叠；
+- 解除隔离必须为每个传播目标给出处置数量（放行/返炼/降级/销毁），合计与隔离数量严格相等才提交；
+- `GET /inventory/lots/{lot_id}/trace` 从任一库存批次查看来源谱系、影响比例、当前空闲/预留/隔离/可用数量和完整决定链。
+
 现场准入子域位于 `robot_trials` 包，负责油田巡检机器人的设备构建登记、不可变试验协议、观测分片导入、异常观测复核、统计任务租约、准入决定和审计报告。该子域不连接机器人硬件，只处理已经结构化的试验记录。
 
 ## 目录
@@ -67,4 +77,4 @@ PYTHONPATH=src python3 -m robot_trials.acceptance --workspace .
 PYTHONPATH=src python3 -m oil_supply.api --database oil_supply.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖报价、设施、线路、停运事件、库存批次、提名、能力分配、发运、供应情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖报价、设施、线路、停运事件、库存批次、提名、能力分配、发运（`POST /transfers`）、到货（`POST /transfers/{id}/receive`）、供应情景、质量样品（`POST /quality/samples`）、检测版本（`POST /quality/tests` 与 `POST /quality/tests/{id}/confirm`）、混兑（`POST /blends`）、库存预留（`POST /inventory/reservations`）、隔离案件（`POST /isolation/cases`、`GET /isolation/cases/{id}`、`POST /isolation/cases/{id}/release`）、批次谱系视图（`GET /inventory/lots/{id}/trace`）和审计链。新增 `quality` 角色负责取样与检测登记，隔离立案与解除由 `risk` 角色执行。服务重启后，SQLite 中的业务状态和历史版本会继续保留。

@@ -27,18 +27,35 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .quality import QualityOperations
+from .genealogy import lot_free_barrels
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "blend.write",
+        "reservation.write",
+    },
+    "risk": {
+        "outage.write",
+        "scenario.approve",
+        "report.read",
+        "case.write",
+        "case.release",
+        "test.confirm",
+    },
     "auditor": {"report.read", "audit.read"},
+    "quality": {"sample.write", "test.write", "test.confirm", "report.read"},
 }
 
 
-class SupplyService:
+class SupplyService(QualityOperations):
     def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
@@ -426,11 +443,15 @@ class SupplyService:
         if lot is None:
             raise NotFound("库存批次不存在")
         allocated = Decimal(nomination["allocated_barrels"])
-        available = Decimal(lot["available_barrels"])
         if lot["facility_id"] != nomination["origin_id"] or lot["product"] != self.route(nomination["route_id"])["product"]:
             raise Conflict("库存批次与线路起点或油品不匹配")
-        if available < allocated:
-            raise Conflict("库存不足以完成分配")
+        available = Decimal(lot["available_barrels"])
+        free = lot_free_barrels(self.connection, lot_id)
+        if free < allocated:
+            raise Conflict(
+                f"可发运数量不足：未被预留或隔离的数量 {decimal_text(free)}，申请发运 "
+                f"{decimal_text(allocated)}"
+            )
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
         with transaction(self.connection, immediate=True):
@@ -464,6 +485,33 @@ class SupplyService:
             "expected_delivered_barrels": decimal_text(expected_delivery),
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
         }
+
+    def receive_transfer(self, actor_id: str, transfer_id: str) -> dict[str, Any]:
+        """登记到货：待处置（held）的转运必须先完成处置放行，到货后成为历史。"""
+        self._require(actor_id, "transfer.write")
+        with transaction(self.connection, immediate=True):
+            transfer = self.connection.execute(
+                "SELECT * FROM transfers WHERE transfer_id=?", (transfer_id,)
+            ).fetchone()
+            if transfer is None:
+                raise NotFound("转运不存在")
+            if transfer["state"] == "held":
+                raise InvalidState("转运处于质量待处置状态，不能登记到货")
+            if transfer["state"] != "in_transit":
+                raise InvalidState(f"转运当前状态为 {transfer['state']}，不能登记到货")
+            arrived_at = self._now()
+            self.connection.execute(
+                "UPDATE transfers SET state='delivered',arrived_at=?,revision=revision+1 "
+                "WHERE transfer_id=? AND state='in_transit'",
+                (arrived_at, transfer_id),
+            )
+            self.connection.execute(
+                "UPDATE nominations SET state='delivered',revision=revision+1 "
+                "WHERE nomination_id=? AND state='in_transit'",
+                (transfer["nomination_id"],),
+            )
+            self._audit("transfer", transfer_id, "transfer.delivered", actor_id, {"arrived_at": arrived_at})
+        return {"transfer_id": transfer_id, "state": "delivered", "arrived_at": arrived_at}
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','quality')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS transfers (
     expected_delivered_barrels TEXT NOT NULL,
     departed_at TEXT NOT NULL,
     arrived_at TEXT,
-    state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
+    state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','held','delivered','disputed')),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL
@@ -180,6 +180,135 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     PRIMARY KEY(scope, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS quality_samples (
+    sample_id TEXT PRIMARY KEY,
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    sampled_quantity_barrels TEXT NOT NULL,
+    sampled_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quality_test_versions (
+    test_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id TEXT NOT NULL REFERENCES quality_samples(sample_id),
+    version_no INTEGER NOT NULL,
+    test_code TEXT NOT NULL,
+    measured_value TEXT NOT NULL,
+    spec_min TEXT NOT NULL,
+    spec_max TEXT NOT NULL,
+    conclusion TEXT NOT NULL CHECK(conclusion IN ('pass','fail','inconclusive')),
+    method TEXT NOT NULL,
+    instrument_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','confirmed','withdrawn')),
+    recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    recorded_at TEXT NOT NULL,
+    UNIQUE(sample_id, version_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_versions_sample
+ON quality_test_versions(sample_id, version_no);
+
+CREATE TABLE IF NOT EXISTS quality_test_confirmations (
+    test_version_id INTEGER NOT NULL REFERENCES quality_test_versions(test_version_id),
+    confirmed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    confirmed_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(test_version_id, confirmed_by)
+);
+
+CREATE TABLE IF NOT EXISTS blends (
+    blend_id TEXT PRIMARY KEY,
+    output_lot_id TEXT NOT NULL UNIQUE REFERENCES inventory_lots(lot_id),
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    product TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    output_quantity_barrels TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS blend_ingredients (
+    blend_id TEXT NOT NULL REFERENCES blends(blend_id),
+    input_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    quantity_barrels TEXT NOT NULL,
+    PRIMARY KEY(blend_id, input_lot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_blend_ingredients_lot
+ON blend_ingredients(input_lot_id, blend_id);
+
+CREATE TABLE IF NOT EXISTS inventory_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    quantity_barrels TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','consumed','released')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_lot
+ON inventory_reservations(lot_id, state);
+
+CREATE TABLE IF NOT EXISTS isolation_cases (
+    case_id TEXT PRIMARY KEY,
+    sample_id TEXT NOT NULL REFERENCES quality_samples(sample_id),
+    root_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','released')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    released_by TEXT REFERENCES supply_users(user_id),
+    released_at TEXT,
+    release_note TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS isolation_targets (
+    target_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id TEXT NOT NULL REFERENCES isolation_cases(case_id),
+    scope TEXT NOT NULL CHECK(scope IN ('lot','transfer')),
+    lot_id TEXT REFERENCES inventory_lots(lot_id),
+    transfer_id TEXT REFERENCES transfers(transfer_id),
+    isolated_barrels TEXT NOT NULL,
+    transit_mark TEXT NOT NULL DEFAULT 'n/a' CHECK(transit_mark IN ('n/a','held','disposed')),
+    disposition_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(disposition_status IN ('pending','disposed')),
+    disposition_barrels TEXT NOT NULL DEFAULT '0',
+    CHECK((scope='lot' AND lot_id IS NOT NULL AND transfer_id IS NULL)
+       OR (scope='transfer' AND transfer_id IS NOT NULL AND lot_id IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_isolation_targets_lot
+ON isolation_targets(case_id, lot_id) WHERE lot_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_isolation_targets_transfer
+ON isolation_targets(case_id, transfer_id) WHERE transfer_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS isolation_dispositions (
+    disposition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id INTEGER NOT NULL REFERENCES isolation_targets(target_id),
+    action TEXT NOT NULL CHECK(action IN ('release','rework','downgrade','destroy')),
+    quantity_barrels TEXT NOT NULL CHECK(quantity_barrels > '0'),
+    note TEXT NOT NULL DEFAULT '',
+    acted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    acted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_isolation_dispositions_target
+ON isolation_dispositions(target_id, disposition_id);
+
+CREATE TABLE IF NOT EXISTS disposition_derived_lots (
+    destination_lot_id TEXT PRIMARY KEY REFERENCES inventory_lots(lot_id),
+    source_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    target_id INTEGER NOT NULL REFERENCES isolation_targets(target_id),
+    action TEXT NOT NULL CHECK(action IN ('rework','downgrade')),
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS supply_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -198,7 +327,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(
+        str(path), isolation_level=None, timeout=10, check_same_thread=False
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
