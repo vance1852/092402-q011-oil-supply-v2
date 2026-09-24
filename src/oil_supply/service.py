@@ -31,10 +31,18 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "quality.read"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "reservation.write",
+        "quality.read",
+    },
+    "risk": {"outage.write", "scenario.approve", "report.read", "quarantine.write", "quality.read"},
+    "auditor": {"report.read", "audit.read", "quality.read"},
+    "inspector": {"quality.write", "quality.confirm", "quality.read"},
 }
 
 
@@ -290,6 +298,27 @@ class SupplyService:
             raise NotFound("库存批次不存在")
         return dict(row)
 
+    def _open_holds(self, lot_id: str) -> Decimal:
+        rows = self.connection.execute(
+            "SELECT qi.held_barrels FROM quarantine_items qi "
+            "JOIN quarantine_cases qc ON qc.case_id=qi.case_id "
+            "WHERE qi.lot_id=? AND qi.state='held' AND qc.status='open'",
+            (lot_id,),
+        ).fetchall()
+        return sum((Decimal(row["held_barrels"]) for row in rows), Decimal("0"))
+
+    def _active_reserved(self, lot_id: str) -> Decimal:
+        rows = self.connection.execute(
+            "SELECT quantity_barrels FROM inventory_reservations WHERE lot_id=? AND state='active'",
+            (lot_id,),
+        ).fetchall()
+        return sum((Decimal(row["quantity_barrels"]) for row in rows), Decimal("0"))
+
+    def usable_barrels(self, lot: Mapping[str, Any]) -> Decimal:
+        """账面可用减去隔离持有和有效预留后的可动用数量。"""
+        available = Decimal(str(lot["available_barrels"]))
+        return available - self._open_holds(str(lot["lot_id"])) - self._active_reserved(str(lot["lot_id"]))
+
     def inventory_summary(self, facility_id: str, product: str) -> dict[str, Any]:
         rows = self.connection.execute(
             "SELECT * FROM inventory_lots WHERE facility_id=? AND product=? ORDER BY received_at,lot_id",
@@ -429,8 +458,9 @@ class SupplyService:
         available = Decimal(lot["available_barrels"])
         if lot["facility_id"] != nomination["origin_id"] or lot["product"] != self.route(nomination["route_id"])["product"]:
             raise Conflict("库存批次与线路起点或油品不匹配")
-        if available < allocated:
-            raise Conflict("库存不足以完成分配")
+        usable = self.usable_barrels(lot)
+        if usable < allocated:
+            raise Conflict("库存可动用数量不足，存在隔离持有或预留")
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
         with transaction(self.connection, immediate=True):

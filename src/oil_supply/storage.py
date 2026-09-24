@@ -8,13 +8,15 @@ from pathlib import Path
 from typing import Iterator
 
 
+USER_ROLES = ("planner", "dispatcher", "risk", "auditor", "inspector")
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','inspector')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,11 +196,158 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS quality_samples (
+    sample_id TEXT PRIMARY KEY,
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    sample_kind TEXT NOT NULL DEFAULT 'routine'
+        CHECK(sample_kind IN ('routine','retest','investigation')),
+    drawn_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    drawn_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_samples_lot
+ON quality_samples(lot_id, sample_id);
+
+CREATE TABLE IF NOT EXISTS quality_test_versions (
+    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id TEXT NOT NULL REFERENCES quality_samples(sample_id),
+    metric TEXT NOT NULL,
+    version_no INTEGER NOT NULL,
+    result_value TEXT NOT NULL,
+    conclusion TEXT NOT NULL CHECK(conclusion IN ('pass','fail','inconclusive')),
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','confirmed')),
+    supersedes_version_id INTEGER REFERENCES quality_test_versions(version_id),
+    tested_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    tested_at TEXT NOT NULL,
+    confirmed_by TEXT REFERENCES supply_users(user_id),
+    confirmed_at TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(sample_id, metric, version_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_tests_sample
+ON quality_test_versions(sample_id, metric, version_no);
+
+CREATE TABLE IF NOT EXISTS blend_events (
+    blend_id TEXT PRIMARY KEY,
+    target_lot_id TEXT NOT NULL UNIQUE REFERENCES inventory_lots(lot_id),
+    blended_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    blended_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS blend_lines (
+    blend_id TEXT NOT NULL REFERENCES blend_events(blend_id),
+    source_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    quantity_barrels TEXT NOT NULL,
+    PRIMARY KEY(blend_id, source_lot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_blend_lines_source
+ON blend_lines(source_lot_id, blend_id);
+
+CREATE TABLE IF NOT EXISTS quarantine_cases (
+    case_id TEXT PRIMARY KEY,
+    root_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    test_version_id INTEGER NOT NULL REFERENCES quality_test_versions(version_id),
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed')),
+    opened_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    opened_at TEXT NOT NULL,
+    closed_by TEXT REFERENCES supply_users(user_id),
+    closed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_cases_root
+ON quarantine_cases(root_lot_id, status);
+
+CREATE TABLE IF NOT EXISTS quarantine_items (
+    case_id TEXT NOT NULL REFERENCES quarantine_cases(case_id),
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    held_barrels TEXT NOT NULL,
+    impact_ratio TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','released')),
+    released_at TEXT,
+    PRIMARY KEY(case_id, lot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_items_lot
+ON quarantine_items(lot_id, state);
+
+CREATE TABLE IF NOT EXISTS quarantine_dispositions (
+    disposition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id TEXT NOT NULL,
+    lot_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('release','downgrade','destroy')),
+    quantity_barrels TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    actor_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(case_id, lot_id) REFERENCES quarantine_items(case_id, lot_id)
+);
+
+CREATE TABLE IF NOT EXISTS transfer_disposition_flags (
+    transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+    case_id TEXT NOT NULL REFERENCES quarantine_cases(case_id),
+    status TEXT NOT NULL DEFAULT 'pending_disposition'
+        CHECK(status IN ('pending_disposition','disposed')),
+    flagged_at TEXT NOT NULL,
+    disposed_by TEXT REFERENCES supply_users(user_id),
+    disposed_at TEXT,
+    disposition_note TEXT,
+    PRIMARY KEY(transfer_id, case_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    quantity_barrels TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','consumed','cancelled')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_reservations_lot
+ON inventory_reservations(lot_id, state);
 """
 
 
+def _migrate_supply_users(connection: sqlite3.Connection) -> None:
+    """把早期缺少 inspector 角色的用户表重建为当前约束。"""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='supply_users'"
+    ).fetchone()
+    if row is None or "'inspector'" in row[0]:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.execute(
+            "CREATE TABLE supply_users_migrated ("
+            "user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+            "role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','inspector')), "
+            "active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO supply_users_migrated(user_id,display_name,role,active,created_at) "
+            "SELECT user_id,display_name,role,active,created_at FROM supply_users"
+        )
+        connection.execute("DROP TABLE supply_users")
+        connection.execute("ALTER TABLE supply_users_migrated RENAME TO supply_users")
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -208,6 +357,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    _migrate_supply_users(connection)
     connection.executescript(SCHEMA)
 
 

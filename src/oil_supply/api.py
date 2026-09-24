@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .errors import SupplyError, ValidationFailed
-from .service import SupplyService
+from .quality import QualityService
 from .storage import connect
 
 
@@ -22,8 +23,9 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: QualityService) -> None:
         self.service = service
+        self._lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +47,11 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        # 单个 SQLite 连接在请求线程间共享，串行化以保持事务语义。
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
+
+    def _dispatch(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -83,6 +90,28 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/quality/samples":
+                return Response(201, self.service.create_sample(actor, payload))
+            if method == "POST" and path == "/quality/tests":
+                return Response(201, self.service.record_test(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["quality", "tests"] and parts[3] == "confirm":
+                return Response(200, self.service.confirm_test(actor, int(parts[2])))
+            if method == "POST" and path == "/blends":
+                return Response(201, self.service.record_blend(actor, payload))
+            if method == "POST" and path == "/quarantine/cases":
+                return Response(201, self.service.open_quarantine(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["quarantine", "cases"]:
+                return Response(200, self.service.quarantine_case(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["quarantine", "cases"] and parts[3] == "release":
+                return Response(200, self.service.release_quarantine(actor, parts[2], payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "dispose":
+                return Response(200, self.service.dispose_transfer(actor, parts[1], payload))
+            if method == "POST" and path == "/inventory/reservations":
+                return Response(201, self.service.reserve_inventory(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["inventory", "reservations"] and parts[3] == "cancel":
+                return Response(200, self.service.cancel_reservation(actor, parts[2]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["inventory", "lots"] and parts[3] == "trace":
+                return Response(200, self.service.lot_trace(actor, parts[2]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
@@ -126,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(QualityService(connection))))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

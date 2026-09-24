@@ -27,6 +27,17 @@ def required_text(value: object, field: str, maximum: int = 256) -> str:
     return result
 
 
+def optional_text(value: object, field: str, maximum: int = 256) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationFailed(f"{field} 必须是字符串")
+    result = value.strip()
+    if len(result) > maximum:
+        raise ValidationFailed(f"{field} 不能超过 {maximum} 个字符")
+    return result
+
+
 def identifier(value: object, field: str) -> str:
     result = required_text(value, field, 64)
     if not IDENTIFIER.fullmatch(result):
